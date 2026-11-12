@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# runtime output
+*.log
+*.npy
+*.npz
+.shards/
+.shards_stale_*/
+*_start.json
+*_end.json
+*_summary.json

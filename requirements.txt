@@ -1,0 +1,4 @@
+numpy
+pyzmq
+cbor2
+dectris-compression
