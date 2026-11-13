@@ -12,10 +12,13 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from logging.handlers import QueueListener
 from multiprocessing import Event, Process, Queue
@@ -28,6 +31,26 @@ from stream_decode import decode_message
 from worker import series_shard_dir, worker
 
 
+@contextmanager
+def defer_interrupts(logger):
+    """Delay Ctrl+C / SIGTERM until the block finishes (an interrupted merge loses data)."""
+    received = []
+
+    def handler(signum, frame):
+        if not received:
+            logger.warning("Interrupt received while merging; will stop once the merge is done")
+        received.append(signum)
+
+    old = {sig: signal.signal(sig, handler) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+    if received:
+        raise KeyboardInterrupt
+
+
 class Series:
     def __init__(self, series_id):
         self.series_id = series_id
@@ -35,6 +58,7 @@ class Series:
         self.end_received = False
         self.images_forwarded = None
         self.done = {}  # worker_idx -> list of reports
+        self.t_start = time.monotonic()
 
 
 class Coordinator:
@@ -68,6 +92,10 @@ class Coordinator:
             self.logger.info("Series %s: end received, waiting for workers to finish", s.series_id)
         elif kind == "worker_done":
             s.done.setdefault(msg["worker"], []).append(msg)
+            self.logger.debug("Series %s: worker %s done (%d frames, hits %s)%s; %d/%d workers reported",
+                              s.series_id, msg["worker"], msg["frames"], msg["hits"],
+                              " partial" if msg.get("partial") else "",
+                              len(s.done), self.num_workers)
         else:
             self.logger.warning("Unknown control message %r", kind)
             return
@@ -76,11 +104,18 @@ class Coordinator:
             self.finalize(s.series_id, partial=False)
 
     def finalize(self, series_id, partial):
+        with defer_interrupts(self.logger):
+            self._finalize(series_id, partial)
+
+    def _finalize(self, series_id, partial):
         s = self.series.pop(series_id)
         base = self._base(s)
+        elapsed = time.monotonic() - s.t_start  # start message -> all workers done
         self.logger.info("Series %s: merging worker shards...", series_id)
+        t_merge = time.monotonic()
         n_frames, hits = merge_series(series_shard_dir(self.shard_root, series_id), base,
                                       keep_shards=self.keep_shards)
+        t_merge = time.monotonic() - t_merge
 
         if s.images_forwarded is not None and n_frames != s.images_forwarded:
             self.logger.warning("Series %s: %d images forwarded but %d frames written",
@@ -91,6 +126,9 @@ class Coordinator:
             "images_forwarded": s.images_forwarded,
             "frames_written": n_frames,
             "hits": hits,
+            "processing_seconds": round(elapsed, 3),
+            "frames_per_second": round(n_frames / elapsed, 1) if elapsed > 0 else None,
+            "merge_seconds": round(t_merge, 3),
             "frames_per_worker": {str(w): sum(r["frames"] for r in reports)
                                   for w, reports in sorted(s.done.items())},
         }
@@ -101,27 +139,64 @@ class Coordinator:
         self.logger.log(level, "Series %s %s: %d frames, hits per threshold %s -> %s_*",
                         series_id, "INCOMPLETE (saved partial data)" if partial else "complete",
                         n_frames, hits, base)
+        self.logger.info("Series %s: %.1f s from start to last worker (%.0f fps incl. waiting "
+                         "for the detector), merge %.1f s", series_id, elapsed,
+                         n_frames / elapsed if elapsed > 0 else 0, t_merge)
 
     def finalize_all_partial(self):
         for series_id in list(self.series):
             self.finalize(series_id, partial=True)
 
 
+def parse_host(value):
+    """Accept 'host', 'host:port', 'tcp://host:port', 'http://host/' etc.
+
+    Returns (hostname, port_or_None).
+    """
+    v = value.strip()
+    v = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", v)  # drop scheme (http://, tcp://)
+    v = v.split("/", 1)[0]                              # drop path
+    if not v:
+        raise argparse.ArgumentTypeError(f"invalid host: {value!r}")
+    if v.startswith("["):                               # [IPv6]:port
+        host, _, rest = v[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else None
+    elif v.count(":") == 1:
+        host, port = v.split(":")
+    else:
+        host, port = v, None
+    if port is not None:
+        if not port.isdigit():
+            raise argparse.ArgumentTypeError(f"invalid port in {value!r}")
+        port = int(port)
+    return host, port
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Receive a DECTRIS Stream v2 and save sparse hit lists.")
-    parser.add_argument("--hostname", type=str, default="localhost",
-                        help="Hostname or IP address to connect to (default: localhost)")
-    parser.add_argument("--port", type=int, default=31001,
-                        help="Port number to connect to (default: 31001)")
-    parser.add_argument("--num-workers", type=int, default=8,
+    parser = argparse.ArgumentParser(
+        description="Receive a DECTRIS Stream v2 and save sparse hit lists.",
+        epilog="examples:\n"
+               "  python main.py 192.168.20.231\n"
+               "  python main.py http://192.168.20.231/ -n 16 -o /data/run1\n"
+               "  python main.py 192.168.20.231:31001 -v",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("host", metavar="HOST", type=parse_host,
+                        help="Detector hostname or IP; may include a scheme and/or port "
+                             "(e.g. 192.168.20.231, http://192.168.20.231/, host:31001)")
+    parser.add_argument("-p", "--port", type=int, default=None,
+                        help="Stream port (default: 31001, or the port given in HOST)")
+    parser.add_argument("-n", "--num-workers", type=int, default=8,
                         help="Number of worker processes to spawn (default: 8)")
-    parser.add_argument("--output-dir", type=str, default=".",
+    parser.add_argument("-o", "--output-dir", type=str, default=".",
                         help="Directory for output files (default: current directory)")
-    parser.add_argument("--keep-shards", action="store_true",
+    parser.add_argument("-k", "--keep-shards", action="store_true",
                         help="Keep per-worker shard files after merging (for debugging)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable verbose logging (debug mode)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.hostname, host_port = args.host
+    args.port = args.port or host_port or 31001
+    return args
 
 
 def _raise_keyboard_interrupt(signum, frame):
@@ -139,8 +214,12 @@ def main():
 
     log_queue = Queue()
     setup_logging(log_queue=None, level=log_level,
-                  log_file=os.path.join(args.output_dir, "pilatus4_stream.log"))
+                  log_file=os.path.join(args.output_dir, "sparsifier.log"))
     logger = logging.getLogger("main")
+    logger.info("===== sparsifier started: %s", " ".join(sys.argv))
+    logger.info("Settings: host=%s port=%d workers=%d output_dir=%s keep_shards=%s verbose=%s",
+                args.hostname, args.port, args.num_workers, os.path.abspath(args.output_dir),
+                args.keep_shards, args.verbose)
     listener = QueueListener(log_queue, *logging.getLogger().handlers, respect_handler_level=True)
     listener.start()
 
@@ -151,7 +230,7 @@ def main():
         logger.warning("Found leftover shards from a previous run; moved to %s", stale)
     os.makedirs(shard_root, exist_ok=True)
 
-    ipc_dir = tempfile.mkdtemp(prefix="sparsificator_")
+    ipc_dir = tempfile.mkdtemp(prefix="sparsifier_")
     worker_endpoints = [f"ipc://{ipc_dir}/w{i}" for i in range(args.num_workers)]
     endpoint = f"tcp://{args.hostname}:{args.port}"
 
@@ -213,6 +292,12 @@ def main():
         exit_code = 1
     finally:
         shutil.rmtree(ipc_dir, ignore_errors=True)
+        if not args.keep_shards:
+            try:
+                os.rmdir(shard_root)  # only succeeds if empty (all series merged)
+            except OSError:
+                if os.path.isdir(shard_root):
+                    logger.warning("Unmerged shard data left in %s", shard_root)
         logger.info("All processes stopped. Exiting.")
         listener.stop()
     sys.exit(exit_code)

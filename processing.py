@@ -39,28 +39,45 @@ def build_bad_pixel_masks(start_message):
 
 
 def process_frame(data, image_id, bad_mask=None):
-    """Find all pixels with 0 < value < dtype max (and not masked).
+    """Sparsify one 2D frame. See process_frames()."""
+    return process_frames(data[np.newaxis], [image_id], bad_mask)
+
+
+def process_frames(stack, image_ids, bad_mask=None):
+    """Find all pixels with 0 < value < dtype max (and not masked) in a stack of frames.
+
+    Frames are mostly zeros, so we first collect the nonzero pixels (one full
+    pass over the data) and apply the remaining tests only to that small set.
+    Processing many small frames in one call avoids per-frame numpy overhead.
 
     Parameters:
-        data (np.ndarray): 2D integer image.
-        image_id (int): Frame index within the series.
-        bad_mask (np.ndarray[bool] | None): True for pixels to ignore.
+        stack (np.ndarray): 3D integer array (n_frames, height, width).
+        image_ids (sequence of int): image_id for each frame.
+        bad_mask (np.ndarray[bool] | None): 2D, True for pixels to ignore.
 
     Returns:
-        np.ndarray with dtype HIT_DTYPE (possibly empty).
+        np.ndarray with dtype HIT_DTYPE (possibly empty), ordered by (frame, y, x).
     """
-    if data.dtype.kind not in "ui":
-        raise TypeError(f"expected integer image data, got {data.dtype}")
+    if stack.dtype.kind not in "ui":
+        raise TypeError(f"expected integer image data, got {stack.dtype}")
+    n, height, width = stack.shape
+    frame_px = height * width
 
-    max_value = np.iinfo(data.dtype).max  # max = masked / gap / saturated pixels
-    valid = (data > 0) & (data < max_value)
-    if bad_mask is not None and bad_mask.shape == data.shape:
-        valid &= ~bad_mask
+    flat = stack.reshape(-1)
+    idx = np.flatnonzero(flat)
+    values = flat[idx]
+    keep = values < np.iinfo(stack.dtype).max  # max = masked / gap / saturated pixels
+    if stack.dtype.kind == "i":
+        keep &= values > 0
+    if bad_mask is not None and bad_mask.shape == (height, width):
+        keep &= ~bad_mask.ravel()[idx % frame_px if n > 1 else idx]
+    idx, values = idx[keep], values[keep]
 
-    y, x = np.nonzero(valid)
-    hits = np.empty(len(x), dtype=HIT_DTYPE)
-    hits["image_id"] = image_id
+    frame, pixel = np.divmod(idx, frame_px)
+    y, x = np.divmod(pixel, width)
+    hits = np.empty(len(idx), dtype=HIT_DTYPE)
+    hits["image_id"] = np.asarray(image_ids, dtype=np.uint32)[frame] if n > 1 else image_ids[0]
     hits["x"] = x
     hits["y"] = y
-    hits["value"] = data[y, x]
+    hits["value"] = values
     return hits

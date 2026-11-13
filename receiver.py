@@ -7,6 +7,9 @@ reach only ONE worker and the others would never know a series ended.
 
 Instead, this process receives everything and
   * forwards 'image' messages round-robin to the workers (raw bytes, no decode),
+    in batches: everything already waiting on the socket (up to BATCH_MAX_IMAGES /
+    BATCH_MAX_BYTES) goes to one worker in one multipart send. This keeps the
+    per-message Python overhead low at high frame rates (e.g. 100+ kHz),
   * broadcasts 'start' / 'end' to EVERY worker (in-order on each worker's
     socket, so a worker sees 'end' only after all images routed to it), and
   * reports 'start' / 'end' to the main process.
@@ -27,7 +30,9 @@ KIND_IMAGE = b"I"
 KIND_END = b"E"
 KIND_QUIT = b"Q"
 
-WORKER_QUEUE_DEPTH = 64  # max in-flight messages per worker (bounds memory)
+WORKER_QUEUE_DEPTH = 64  # max in-flight batches per worker (bounds memory)
+BATCH_MAX_IMAGES = 256
+BATCH_MAX_BYTES = 1 << 20  # large frames are sent one per batch
 
 
 def _send_blocking(sock, parts, stop_event=None, timeout=None):
@@ -70,12 +75,18 @@ def receiver(endpoint, worker_endpoints, control_queue, stop_event, log_queue, l
     next_worker = 0
     images_in_series = 0
     current_series = None
+    debug = logger.isEnabledFor(logging.DEBUG)
+    stats_t0 = time.monotonic()
+    stats_images = stats_bytes = stats_batches = 0
+    batch = []
+    batch_bytes = 0
 
     def broadcast(kind, payload):
         for s in outs:
             _send_blocking(s, [kind, payload], stop_event)
 
-    def send_image(frame):
+    def send_batch(parts):
+        """Send [KIND_IMAGE, img, img, ...] to the next worker with free queue space."""
         nonlocal next_worker
         n = len(outs)
         give_up_at = None
@@ -83,56 +94,91 @@ def receiver(endpoint, worker_endpoints, control_queue, stop_event, log_queue, l
             if stop_event.is_set():
                 give_up_at = give_up_at or time.monotonic() + 5.0
                 if time.monotonic() > give_up_at:
-                    logger.warning("Workers not accepting data during shutdown; dropping image")
+                    logger.warning("Workers not accepting data during shutdown; dropping %d image(s)",
+                                   len(parts) - 1)
                     return False
             # Round-robin, skipping workers whose queue is full (simple load balancing)
             for k in range(n):
                 idx = (next_worker + k) % n
                 try:
-                    outs[idx].send_multipart([KIND_IMAGE, frame], flags=zmq.NOBLOCK, copy=False)
+                    outs[idx].send_multipart(parts, flags=zmq.NOBLOCK, copy=False)
                     next_worker = (idx + 1) % n
                     return True
                 except zmq.Again:
                     continue
             out_poller.poll(100)  # all workers busy: wait for one to free up
 
+    def flush_batch():
+        nonlocal batch, batch_bytes, images_in_series, stats_t0, stats_images, stats_bytes, stats_batches
+        if not batch:
+            return
+        if send_batch([KIND_IMAGE] + batch):
+            images_in_series += len(batch)
+            if debug:
+                stats_images += len(batch)
+                stats_bytes += batch_bytes
+                stats_batches += 1
+                dt = time.monotonic() - stats_t0
+                if dt >= 1.0:
+                    logger.debug("Receiver: series %s, %d images so far, %.0f images/s, %.1f MB/s, "
+                                 "%.1f images/batch", current_series, images_in_series,
+                                 stats_images / dt, stats_bytes / dt / 1e6, stats_images / stats_batches)
+                    stats_t0 = time.monotonic()
+                    stats_images = stats_bytes = stats_batches = 0
+        batch = []
+        batch_bytes = 0
+
+    def handle(frame):
+        nonlocal batch_bytes, current_series, images_in_series
+        try:
+            msg_type = peek_type(frame.buffer)
+        except Exception:
+            logger.exception("Could not parse message header; dropping message")
+            return
+
+        if msg_type == "image":
+            batch.append(frame)
+            batch_bytes += len(frame.buffer)
+            if len(batch) >= BATCH_MAX_IMAGES or batch_bytes >= BATCH_MAX_BYTES:
+                flush_batch()
+
+        elif msg_type in ("start", "end"):
+            flush_batch()  # images before start/end must reach the workers first
+            raw = frame.bytes
+            header = cbor2.loads(raw)  # no tag decoding / decompression
+            series_id = header.get("series_id")
+            if msg_type == "start":
+                if current_series is not None:
+                    logger.warning("Start of series %s before end of series %s",
+                                   series_id, current_series)
+                current_series = series_id
+                images_in_series = 0
+                broadcast(KIND_START, raw)
+                control_queue.put({"type": "start", "series_id": series_id, "raw": raw})
+                logger.info("Start of series %s", series_id)
+            else:
+                broadcast(KIND_END, raw)
+                control_queue.put({"type": "end", "series_id": series_id, "raw": raw,
+                                   "images_forwarded": images_in_series})
+                logger.info("End of series %s (%d images forwarded)", series_id, images_in_series)
+                current_series = None
+                images_in_series = 0
+        else:
+            logger.warning("Unknown message type %r; dropping", msg_type)
+
     try:
         while not stop_event.is_set():
             if not pull.poll(500):
                 continue
-            frame = pull.recv(copy=False)
-            try:
-                msg_type = peek_type(frame.buffer)
-            except Exception:
-                logger.exception("Could not parse message header; dropping message")
-                continue
-
-            if msg_type == "image":
-                if send_image(frame):
-                    images_in_series += 1
-
-            elif msg_type in ("start", "end"):
-                raw = frame.bytes
-                header = cbor2.loads(raw)  # no tag decoding / decompression
-                series_id = header.get("series_id")
-                if msg_type == "start":
-                    if current_series is not None:
-                        logger.warning("Start of series %s before end of series %s",
-                                       series_id, current_series)
-                    current_series = series_id
-                    images_in_series = 0
-                    broadcast(KIND_START, raw)
-                    control_queue.put({"type": "start", "series_id": series_id, "raw": raw})
-                    logger.info("Start of series %s", series_id)
-                else:
-                    broadcast(KIND_END, raw)
-                    control_queue.put({"type": "end", "series_id": series_id, "raw": raw,
-                                       "images_forwarded": images_in_series})
-                    logger.info("End of series %s (%d images forwarded)", series_id, images_in_series)
-                    current_series = None
-                    images_in_series = 0
-            else:
-                logger.warning("Unknown message type %r; dropping", msg_type)
+            # Drain everything already waiting, then send what is left in the batch.
+            # When data arrives slowly, batches are small and latency stays low.
+            for _ in range(10 * BATCH_MAX_IMAGES):
+                try:
+                    frame = pull.recv(flags=zmq.NOBLOCK, copy=False)
+                except zmq.Again:
+                    break
+                handle(frame)
+            flush_batch()
     except Exception:
         logger.exception("Receiver crashed")
         raise

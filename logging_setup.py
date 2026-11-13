@@ -4,7 +4,7 @@ import sys
 from logging.handlers import QueueHandler
 
 
-def setup_logging(log_queue=None, level=logging.INFO, log_file='pilatus4_stream.log'):
+def setup_logging(log_queue=None, level=logging.INFO, log_file='sparsifier.log'):
     logger = logging.getLogger()
     logger.setLevel(level)
 

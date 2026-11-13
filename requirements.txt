@@ -2,3 +2,4 @@ numpy
 pyzmq
 cbor2
 dectris-compression
+lz4  # only for tools/ (synthetic test data)
